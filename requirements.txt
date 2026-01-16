@@ -1,5 +1,2 @@
 pyTelegramBotAPI
 requests
-flask
-numpy
-scikit-learn

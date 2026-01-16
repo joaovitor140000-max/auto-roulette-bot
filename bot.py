@@ -1,309 +1,213 @@
 import os
 import time
-import threading
 import requests
-import numpy as np
-from datetime import datetime
-from flask import Flask
+import threading
+from collections import deque
 import telebot
-from sklearn.linear_model import LogisticRegression
+import math
 
-# =====================================================
-# CONFIGURAÇÕES GERAIS (ENV)
-# =====================================================
+# ================== CONFIG ==================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-ROULETTE_API = os.getenv("ROULETTE_API_URL")
-BOT_MODE = os.getenv("BOT_MODE", "ALERTA")  # ALERTA ou OPERACAO
+API_URL = os.getenv(
+    "ROULETTE_API_URL",
+    "https://api.casinoscores.com/svc-evolution-stats/stats/auto-roulette"
+)
+BOT_MODE = os.getenv("BOT_MODE", "ALERTA")  # ALERTA ou OPERACAO (apenas alerta aqui)
 
-bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
+API_INTERVAL = 15  # segundos (seguro)
+WINDOW = 24        # janela de análise
+MIN_CONF = 0.60    # confiança mínima
+HOT_CONF = 0.72    # confiança para considerar "quente"
+COLD_ERRORS = 2    # reds seguidos para standby
+STANDBY_TIME = 120 # segundos
 
-# =====================================================
-# ESTADO GLOBAL
-# =====================================================
-user_data = {}
-ml_model = LogisticRegression()
-ml_trained = False
+# ================== BOT ==================
+bot = telebot.TeleBot(TOKEN, parse_mode="Markdown")
 
-dashboard_state = {
-    "market_mode": "ANALISANDO",
-    "session": "-",
-    "entries_today": 0,
-    "winrate": 0,
-    "ml_prob": 0,
-    "last_update": "-"
+# ================== ESTADO ==================
+state = {
+    "chat_id": None,
+    "banca_inicial": 0.0,
+    "banca_atual": 0.0,
+    "meta_dia": 0.0,
+    "wins": 0,
+    "reds": 0,
+    "errors_row": 0,
+    "last_spin": None,
+    "history": deque(maxlen=WINDOW),
+    "session_profit": 0.0,
+    "standby_until": 0
 }
 
-# =====================================================
-# DASHBOARD WEB
-# =====================================================
-@app.route("/")
-def home():
-    return "BOT AUTO ROULETTE ONLINE", 200
-
-@app.route("/dashboard")
-def dashboard():
-    return f"""
-    <html>
-    <head>
-        <title>Auto Roulette Dashboard</title>
-        <meta http-equiv="refresh" content="15">
-        <style>
-            body {{
-                background:#0f172a;
-                color:#e5e7eb;
-                font-family:Arial;
-                padding:20px;
-            }}
-            .card {{
-                background:#020617;
-                padding:15px;
-                border-radius:8px;
-                margin-bottom:10px;
-            }}
-            h2 {{ color:#38bdf8; }}
-        </style>
-    </head>
-    <body>
-        <h2>🎰 AUTO ROULETTE – DASHBOARD</h2>
-        <div class="card">📊 Mercado: <b>{dashboard_state['market_mode']}</b></div>
-        <div class="card">⏰ Sessão: <b>{dashboard_state['session']}</b></div>
-        <div class="card">🎯 Entradas hoje: <b>{dashboard_state['entries_today']}</b></div>
-        <div class="card">📈 Winrate: <b>{dashboard_state['winrate']}%</b></div>
-        <div class="card">🤖 ML Prob: <b>{dashboard_state['ml_prob']}%</b></div>
-        <div class="card">🕒 Atualizado: <b>{dashboard_state['last_update']}</b></div>
-    </body>
-    </html>
-    """
-
-# =====================================================
-# UTILIDADES
-# =====================================================
-def current_session():
-    h = datetime.now().hour
-    if 9 <= h < 12:
-        return "MANHA"
-    if 14 <= h < 17:
-        return "TARDE"
-    if 19 <= h < 22:
-        return "NOITE"
-    return None
-
-def fetch_numbers(limit=72):
-    try:
-        r = requests.get(
-            ROULETTE_API,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://casinoscores.com"
-            },
-            timeout=10
-        )
-        data = r.json()
-        history = data.get("data") or data.get("history") or []
-        nums = []
-        for item in history[:limit]:
-            n = item.get("result") or item.get("number")
-            if n is not None:
-                nums.append(int(n))
-        return nums
-    except:
-        return []
-
-# =====================================================
-# ANÁLISE ESTATÍSTICA AVANÇADA
-# =====================================================
-def analyze_advanced(numbers):
-    if len(numbers) < 24:
-        return None
-
-    last_24 = numbers[:24]
-    last_6 = numbers[:6]
-
-    valid = [n for n in last_24 if n != 0]
-    freq = {
-        1: len([n for n in valid if n % 3 == 1]),
-        2: len([n for n in valid if n % 3 == 2]),
-        3: len([n for n in valid if n % 3 == 0])
+# ================== API ==================
+def fetch_numbers():
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
     }
+    try:
+        r = requests.get(API_URL, headers=headers, timeout=15)
+        if r.status_code == 200:
+            js = r.json()
+            data = js.get("data") or js.get("history") or []
+            nums = []
+            for it in data:
+                n = it.get("result")
+                if isinstance(n, int):
+                    nums.append(n)
+            return nums[:WINDOW]
+    except Exception as e:
+        print("API error:", e)
+    return []
 
-    diff = max(freq.values()) - min(freq.values())
-    if diff < 4:
-        return None
+# ================== LÓGICA ==================
+def col(num):
+    if num == 0:
+        return 0
+    m = num % 3
+    return 3 if m == 0 else m
 
-    min_col = min(freq, key=freq.get)
-    short_hits = len([n for n in last_6 if n != 0 and (n % 3 or 3) == min_col])
-    if short_hits >= 2:
-        return None
-
-    if last_24.count(0) >= 2:
-        return None
-
-    confidence = diff / len(valid)
-    if confidence < 0.62:
-        return None
-
-    play_cols = [c for c in [1, 2, 3] if c != min_col]
-    return play_cols, confidence
-
-# =====================================================
-# BACKTEST CURTO
-# =====================================================
-def backtest_strategy(history):
-    wins = losses = 0
-    max_loss_seq = cur_loss = 0
-
-    for i in range(36, len(history) - 2):
-        window = history[i-36:i]
-        analysis = analyze_advanced(window)
-        if not analysis:
-            continue
-
-        cols, _ = analysis
-        r1 = history[i]
-        r2 = history[i+1]
-
-        def hit(r):
-            if r == 0:
-                return True
-            return (r % 3 or 3) in cols
-
-        if hit(r1) or hit(r2):
-            wins += 1
-            cur_loss = 0
-        else:
-            losses += 1
-            cur_loss += 1
-            max_loss_seq = max(max_loss_seq, cur_loss)
-
-    total = wins + losses
+def confidence_from_counts(counts, total):
     if total == 0:
+        return 0.0
+    return max(counts.values()) / total
+
+def analyze(history):
+    # ignora zeros para padrão de coluna
+    valid = [n for n in history if n != 0]
+    if len(valid) < 8:
         return None
+
+    counts = {
+        1: sum(1 for n in valid if col(n) == 1),
+        2: sum(1 for n in valid if col(n) == 2),
+        3: sum(1 for n in valid if col(n) == 3),
+    }
+    conf = confidence_from_counts(counts, len(valid))
+
+    # exclui a menos frequente
+    exclude = min(counts, key=counts.get)
+    play = [c for c in (1, 2, 3) if c != exclude]
 
     return {
-        "winrate": round(wins / total, 3),
-        "max_loss": max_loss_seq
+        "play": play,
+        "exclude": exclude,
+        "conf": conf,
+        "counts": counts
     }
 
-# =====================================================
-# ML LEVE (CONFIRMAÇÃO)
-# =====================================================
-def build_features(history):
-    last = history[:36]
-    valid = [n for n in last if n != 0]
+def session_targets():
+    # regra: se muito instável → 2x, senão 4x no dia (em sessões)
+    if state["errors_row"] >= 2:
+        return 2.0
+    return 4.0
 
-    freq = [
-        len([n for n in valid if n % 3 == 1]),
-        len([n for n in valid if n % 3 == 2]),
-        len([n for n in valid if n % 3 == 0])
-    ]
+def should_standby():
+    return time.time() < state["standby_until"]
 
-    diff = max(freq) - min(freq)
-    zero_rate = last.count(0) / len(last)
-    volatility = np.std(freq)
-
-    return [diff, zero_rate, volatility]
-
-def train_ml(samples):
-    global ml_trained
-    X, y = [], []
-    for h, res in samples:
-        X.append(build_features(h))
-        y.append(res)
-    ml_model.fit(X, y)
-    ml_trained = True
-
-def ml_predict(history):
-    if not ml_trained:
-        return 0
-    feat = np.array(build_features(history)).reshape(1, -1)
-    return ml_model.predict_proba(feat)[0][1]
-
-# =====================================================
-# LOOP PRINCIPAL
-# =====================================================
-def signal_loop(chat_id):
-    last_number = None
-
-    while chat_id in user_data:
-        session = current_session()
-        dashboard_state["session"] = session or "-"
-
-        if not session:
-            time.sleep(60)
-            continue
-
-        numbers = fetch_numbers()
-        if not numbers or numbers[0] == last_number:
-            time.sleep(20)
-            continue
-
-        last_number = numbers[0]
-
-        bt = backtest_strategy(numbers)
-        if not bt or bt["winrate"] < 0.58 or bt["max_loss"] >= 4:
-            dashboard_state["market_mode"] = "STOP"
-            time.sleep(60)
-            continue
-
-        analysis = analyze_advanced(numbers)
-        if not analysis:
-            time.sleep(30)
-            continue
-
-        cols, conf = analysis
-        ml_prob = ml_predict(numbers)
-
-        if ml_prob < 0.65:
-            time.sleep(30)
-            continue
-
-        dashboard_state.update({
-            "market_mode": "ATIVO",
-            "entries_today": dashboard_state["entries_today"] + 1,
-            "winrate": int(bt["winrate"] * 100),
-            "ml_prob": int(ml_prob * 100),
-            "last_update": datetime.now().strftime("%H:%M:%S")
-        })
-
-        if BOT_MODE == "ALERTA":
-            bot.send_message(
-                chat_id,
-                f"🔔 *ALERTA PROFISSIONAL*\n\n"
-                f"🎯 Colunas: {cols}\n"
-                f"📊 Confiança: {int(conf*100)}%\n"
-                f"🤖 ML: {int(ml_prob*100)}%",
-                parse_mode="Markdown"
-            )
-
-        time.sleep(90)
-
-# =====================================================
-# TELEGRAM
-# =====================================================
-@bot.message_handler(commands=["start"])
-def start(message):
-    user_data[message.chat.id] = {}
+# ================== LOOP ==================
+def loop_signals():
     bot.send_message(
-        message.chat.id,
-        "🤖 *Bot Auto Roulette*\n\nSistema profissional iniciado.\nModo atual: "
-        + BOT_MODE,
-        parse_mode="Markdown"
+        state["chat_id"],
+        "🤖 *Bot iniciado*\n"
+        "_Alertas estatísticos. Não garante ganhos._"
     )
-    threading.Thread(
-        target=signal_loop,
-        args=(message.chat.id,),
-        daemon=True
-    ).start()
 
-# =====================================================
-# START
-# =====================================================
+    while True:
+        try:
+            if should_standby():
+                time.sleep(5)
+                continue
+
+            nums = fetch_numbers()
+            if not nums:
+                time.sleep(API_INTERVAL)
+                continue
+
+            spin = nums[0]
+            if state["last_spin"] == spin:
+                time.sleep(API_INTERVAL)
+                continue
+
+            state["last_spin"] = spin
+            state["history"].appendleft(spin)
+
+            analysis = analyze(list(state["history"]))
+            if not analysis:
+                time.sleep(API_INTERVAL)
+                continue
+
+            conf = analysis["conf"]
+            play = analysis["play"]
+
+            # estabilidade / confiança
+            if conf < MIN_CONF:
+                time.sleep(API_INTERVAL)
+                continue
+
+            hot = conf >= HOT_CONF
+            daily_mult = session_targets()
+            state["meta_dia"] = state["banca_inicial"] * daily_mult
+
+            # valores sugeridos (alerta)
+            banca = state["banca_atual"]
+            v_col = round(banca * 0.05, 2)
+            v_zero = round(banca * 0.01, 2)
+
+            msg = (
+                f"🚨 *SINAL*\n"
+                f"🎯 Colunas: *{play[0]} e {play[1]}*\n"
+                f"🪙 R${v_col} cada | Zero: R${v_zero}\n"
+                f"📈 Confiança: *{int(conf*100)}%* {'🔥' if hot else ''}\n"
+                f"📊 W/R: {state['wins']} / {state['reds']}\n"
+                f"🎯 Meta do dia: *{int(daily_mult)}x*"
+            )
+            bot.send_message(state["chat_id"], msg)
+
+            # simulação de resultado (apenas contagem, não aposta real)
+            if spin == 0 or col(spin) in play:
+                state["wins"] += 1
+                state["errors_row"] = 0
+            else:
+                state["reds"] += 1
+                state["errors_row"] += 1
+                if state["errors_row"] >= COLD_ERRORS:
+                    state["standby_until"] = time.time() + STANDBY_TIME
+                    bot.send_message(
+                        state["chat_id"],
+                        "❄️ *Roleta instável*. Entrando em standby por 2 minutos."
+                    )
+
+            time.sleep(API_INTERVAL)
+
+        except Exception as e:
+            print("Loop error:", e)
+            time.sleep(10)
+
+# ================== TELEGRAM ==================
+@bot.message_handler(commands=["start"])
+def start(msg):
+    state["chat_id"] = msg.chat.id
+    bot.send_message(msg.chat.id, "Qual o valor da sua banca inicial? (ex: 50)")
+
+@bot.message_handler(func=lambda m: state["banca_inicial"] == 0)
+def set_bank(msg):
+    try:
+        v = float(msg.text.replace(",", "."))
+        state["banca_inicial"] = v
+        state["banca_atual"] = v
+        bot.send_message(
+            msg.chat.id,
+            f"✅ Banca registrada: R${v:.2f}\n"
+            "🔎 Iniciando análise contínua..."
+        )
+        threading.Thread(target=loop_signals, daemon=True).start()
+    except:
+        bot.send_message(msg.chat.id, "Digite apenas o número. Ex: 50")
+
+# ================== START ==================
 if __name__ == "__main__":
-    threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=8080),
-        daemon=True
-    ).start()
-
+    print("Bot iniciado (Render Background Worker)")
     bot.remove_webhook()
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+            

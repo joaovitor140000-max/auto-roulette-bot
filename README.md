@@ -1,15 +1,18 @@
-# Roulette Signal Bot 🎯
+# Auto Roulette Bot (Telegram)
 
-Bot de sinais para Auto Roulette Live (Evolution), utilizando dados públicos do CasinoScores.
+Bot em Python para monitorar resultados (API) e enviar sinais no Telegram com filtros de confiança.
 
-## Recursos
-- Sinais apenas com ≥ 75% de confiança
-- Máximo de 2 sinais por hora
-- Meta dinâmica: 2x ou 4x banca
-- Telegram 24h (polling)
-
-## Deploy
-Configure a variável de ambiente:
+## Variáveis de ambiente
 - TELEGRAM_TOKEN
+- CASINO_API_URL
+- STICKER_WIN (opcional)
+- STICKER_RED (opcional)
 
-Compatível com Railway, Replit e VPS.
+## Rodar local
+pip install -r requirements.txt
+python main.py
+
+## Comandos
+- /start
+- /status
+- /statistics

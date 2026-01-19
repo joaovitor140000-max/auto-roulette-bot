@@ -1,54 +1,54 @@
 import requests
 from config import CASINO_API_URL
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-    "Referer": "https://www.casinoscores.com/",
-    "Origin": "https://www.casinoscores.com"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 
-def fetch_numbers():
+_last_status = "—"
+_last_time = "—"
+
+def last_fetch_status():
+    return _last_status
+
+def last_fetch_time():
+    return _last_time
+
+def fetch_latest_number():
+    """
+    Suporta formatos:
+    1) {"data":{"result":{"outcome":{"number":16}}}}
+    2) {"data":[{"result":16}, ...]}
+    """
+    global _last_status, _last_time
     try:
-        print("[DEBUG] Buscando números da roleta...")
-
         r = requests.get(CASINO_API_URL, headers=HEADERS, timeout=15)
-
-        print(f"[DEBUG] Status HTTP: {r.status_code}")
+        _last_time = __import__("datetime").datetime.now().strftime("%H:%M:%S")
 
         if r.status_code != 200:
-            return []
+            _last_status = f"HTTP {r.status_code}"
+            return None
 
-        json_data = r.json()
+        js = r.json()
 
-        # 🔹 múltiplos formatos possíveis
-        data = []
+        # formato 1
+        try:
+            n = js["data"]["result"]["outcome"]["number"]
+            _last_status = "OK"
+            return int(n)
+        except Exception:
+            pass
 
-        if isinstance(json_data, dict):
-            if "data" in json_data:
-                if isinstance(json_data["data"], list):
-                    data = json_data["data"]
-                elif isinstance(json_data["data"], dict):
-                    data = json_data["data"].get("history", [])
+        # formato 2
+        data = js.get("data")
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and "result" in item:
+                    _last_status = "OK"
+                    return int(item["result"])
 
-            elif "history" in json_data:
-                data = json_data["history"]
+        _last_status = "JSON inesperado"
+        return None
 
-        numbers = [
-            int(item["result"])
-            for item in data
-            if isinstance(item, dict) and "result" in item
-        ]
-
-        print(f"[DEBUG] Números extraídos: {numbers[:12]}")
-
-        return numbers
-
-    except Exception as e:
-        print("[API ERROR]", e)
-
-    return []
+    except Exception:
+        _last_status = "ERR"
+        _last_time = __import__("datetime").datetime.now().strftime("%H:%M:%S")
+        return None
